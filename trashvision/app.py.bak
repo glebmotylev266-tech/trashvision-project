@@ -1,0 +1,779 @@
+import csv
+import io
+import os
+import sqlite3
+import uuid
+from datetime import datetime
+
+import cv2
+from flask import (Flask, flash, jsonify, redirect, render_template_string,
+                   request, send_file, url_for)
+from ultralytics import YOLO
+
+# ---------- конфигурация ----------
+app = Flask(__name__)
+app.secret_key = "change-me-in-production"
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
+
+DB = "database.db"
+UPLOAD_DIR = "static/uploads"
+RESULT_DIR = "static/results"
+LOG_DIR = "static/logs"
+
+for _d in (UPLOAD_DIR, RESULT_DIR, LOG_DIR):
+    os.makedirs(_d, exist_ok=True)
+
+# ---------- YOLO ----------
+WASTE_CLASSES = {
+    39: "bottle", 41: "cup", 45: "bowl", 47: "apple",
+    56: "chair", 57: "couch", 58: "potted plant",
+    62: "tv", 63: "laptop", 67: "cell phone",
+}
+
+model = YOLO("best.pt")
+
+
+# ---------- база ----------
+def init_db():
+    con = sqlite3.connect(DB)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS reports (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at  TEXT,
+            location    TEXT,
+            lat         REAL,
+            lng         REAL,
+            source_type TEXT,
+            file_url    TEXT,
+            result_url  TEXT,
+            detections  TEXT,
+            log_url     TEXT,
+            status      TEXT DEFAULT 'done'
+        )
+    """)
+    con.commit()
+    con.close()
+
+
+init_db()
+
+
+# ---------- детекция ----------
+def detect_image(image_path: str):
+    results = model(image_path, conf=0.35)[0]
+    detections = []
+    for box in results.boxes:
+        cls_id = int(box.cls[0])
+        conf = float(box.conf[0])
+        if cls_id in WASTE_CLASSES:
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            detections.append({
+                "class": WASTE_CLASSES[cls_id],
+                "confidence": round(conf, 3),
+                "bbox": [x1, y1, x2, y2],
+            })
+    out_name = f"res_{uuid.uuid4().hex[:8]}.jpg"
+    out_path = os.path.join(RESULT_DIR, out_name)
+    results.save(filename=out_path)
+    return detections, f"/{out_path}"
+
+
+def detect_video(video_path: str, frame_step: int = 30):
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    detections = []
+    idx = 0
+
+    out_name = f"res_{uuid.uuid4().hex[:8]}.mp4"
+    out_path = os.path.join(RESULT_DIR, out_name)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if idx % frame_step == 0:
+            res = model(frame, conf=0.35, verbose=False)[0]
+            for box in res.boxes:
+                cls_id = int(box.cls[0])
+                if cls_id in WASTE_CLASSES:
+                    detections.append({
+                        "frame": idx,
+                        "time_sec": round(idx / fps, 2),
+                        "class": WASTE_CLASSES[cls_id],
+                        "confidence": round(float(box.conf[0]), 3),
+                    })
+            frame = res.plot()
+        writer.write(frame)
+        idx += 1
+
+    cap.release()
+    writer.release()
+
+    return {
+        "total_frames": total_frames,
+        "fps": fps,
+        "duration_sec": round(total_frames / fps, 2),
+        "detections": detections,
+        "result_video": f"/{out_path}",
+    }
+
+
+def write_log(detections, source: str, location: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_name = f"log_{datetime.now().strftime('%Y%m%d')}.txt"
+    log_path = os.path.join(LOG_DIR, log_name)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"[{ts}] source={source} location={location}\n")
+        if not detections:
+            f.write("  - объектов не обнаружено\n")
+        for d in detections:
+            f.write(f"  * {d.get('class')} conf={d.get('confidence')} "
+                    f"bbox={d.get('bbox', d.get('time_sec'))}\n")
+        f.write("\n")
+    return f"/{log_path}"
+
+
+# ---------- шаблоны ----------
+BASE_HTML = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}TrashVision{% endblock %}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+:root{
+  --bg:#0a0f1a; --panel:rgba(20,28,45,.7); --line:rgba(148,163,184,.15);
+  --line2:rgba(148,163,184,.28); --text:#e2e8f0; --muted:#94a3b8;
+  --green:#22c55e; --red:#ef4444; --blue:#3b82f6;
+  --accent:linear-gradient(135deg,#22c55e,#0ea5e9);
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; font:14px/1.5 'Inter',system-ui,Arial,sans-serif;
+  background:
+    radial-gradient(1200px 600px at 10% -10%, rgba(34,197,94,.10), transparent 60%),
+    radial-gradient(1000px 500px at 90% 110%, rgba(59,130,246,.10), transparent 60%),
+    var(--bg);
+  color:var(--text); min-height:100vh;
+}
+.topbar{
+  display:flex; align-items:center; gap:24px;
+  padding:14px 28px; background:rgba(10,15,26,.75);
+  backdrop-filter:blur(14px); border-bottom:1px solid var(--line);
+  position:sticky; top:0; z-index:1000;
+}
+.brand{display:flex; gap:12px; align-items:center}
+.logo{width:40px; height:40px; border-radius:12px; background:var(--accent);
+  display:flex; align-items:center; justify-content:center; font-size:20px;
+  box-shadow:0 6px 20px rgba(34,197,94,.35);}
+.brand h1{margin:0; font-size:16px; letter-spacing:.3px}
+.brand small{color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:1px}
+.nav{display:flex; gap:6px; flex:1; justify-content:center}
+.nav a{display:flex; align-items:center; gap:8px; padding:8px 16px; border-radius:10px;
+  color:var(--muted); text-decoration:none; font-weight:500; transition:.18s;}
+.nav a:hover{background:rgba(148,163,184,.08); color:var(--text)}
+.nav a.active{background:rgba(34,197,94,.14); color:#a7f3c8;
+  box-shadow:inset 0 0 0 1px rgba(34,197,94,.35);}
+.nav .dot{width:8px; height:8px; border-radius:50%; background:var(--muted);
+  display:inline-block;}
+.nav a.active .dot{background:var(--green); box-shadow:0 0 8px var(--green)}
+.stats{display:flex; gap:18px; color:var(--muted); font-size:12px}
+.stat{text-align:right}
+.stat b{display:block; font-size:18px; color:var(--text)}
+.layout{display:grid; grid-template-columns:380px 1fr; height:calc(100vh - 69px);}
+.sidebar{overflow-y:auto; padding:16px; display:flex; flex-direction:column;
+  gap:16px; border-right:1px solid var(--line);
+  background:rgba(10,15,26,.55);}
+#map{width:100%; height:100%; filter:brightness(.92) saturate(.9);}
+.card{background:var(--panel); backdrop-filter:blur(14px);
+  border:1px solid var(--line); border-radius:16px; padding:16px;
+  box-shadow:0 10px 30px rgba(0,0,0,.25);}
+.cardHead{display:flex; gap:12px; align-items:center; margin-bottom:14px}
+.cardHead h2{margin:0; font-size:14px; font-weight:600}
+.cardHead small{color:var(--muted); font-size:11px}
+.icon{width:38px; height:38px; border-radius:10px; display:flex;
+  align-items:center; justify-content:center; font-size:18px;}
+.icon.photo{background:rgba(59,130,246,.14); color:#93c5fd}
+.icon.video{background:rgba(239,68,68,.14); color:#fca5a5}
+.icon.recent{background:rgba(34,197,94,.14); color:#86efac}
+input,button,label{font:inherit}
+form{display:flex; flex-direction:column; gap:10px}
+input[type="text"],input:not([type]){
+  width:100%; padding:10px 14px; background:rgba(15,23,42,.6);
+  border:1px solid var(--line); border-radius:10px; color:var(--text);
+  transition:.15s;
+}
+input:focus{outline:none; border-color:var(--green);
+  box-shadow:0 0 0 3px rgba(34,197,94,.18);}
+.row2{display:grid; grid-template-columns:1fr 1fr; gap:10px}
+.dropzone{display:flex; flex-direction:column; align-items:center;
+  justify-content:center; gap:6px; padding:20px 12px;
+  border:2px dashed var(--line2); border-radius:12px; cursor:pointer;
+  color:var(--muted); text-align:center; transition:.18s;}
+.dropzone:hover, .dropzone.hover{border-color:var(--green); color:var(--text);
+  background:rgba(34,197,94,.06);}
+.dropzone input{display:none}
+.dropIcon{width:36px; height:36px; border-radius:50%;
+  background:rgba(34,197,94,.15); color:var(--green);
+  display:flex; align-items:center; justify-content:center; font-size:18px;}
+button.primary{padding:11px 16px; background:var(--accent); border:none;
+  border-radius:10px; color:#04150a; font-weight:600; cursor:pointer;
+  box-shadow:0 6px 20px rgba(34,197,94,.25); transition:.15s;}
+button.primary:hover{transform:translateY(-1px); box-shadow:0 10px 26px rgba(34,197,94,.35)}
+button.primary:active{transform:translateY(0)}
+.recentList{display:flex; flex-direction:column; gap:8px;
+  max-height:320px; overflow:auto;}
+.recentItem{padding:10px; border-radius:10px;
+  background:rgba(15,23,42,.55); border-left:3px solid var(--blue);
+  font-size:12px;}
+.recentItem.video{border-left-color:var(--red)}
+.recentTop{display:flex; justify-content:space-between; align-items:center}
+.recentLoc{color:var(--text); margin-top:4px; font-weight:500}
+.recentMeta{color:var(--muted); font-size:11px; margin-top:2px}
+.recentLink{color:var(--green); text-decoration:none; font-size:11px;
+  display:inline-block; margin-top:4px;}
+.recentLink:hover{text-decoration:underline}
+.empty{color:var(--muted); font-size:12px; padding:14px; text-align:center;
+  border:1px dashed var(--line); border-radius:10px;}
+.badge{font-size:10px; padding:2px 8px; border-radius:999px;
+  background:rgba(148,163,184,.18); color:var(--muted);
+  text-transform:uppercase; letter-spacing:.5px;}
+.badge.image{background:rgba(59,130,246,.18); color:#93c5fd}
+.badge.video{background:rgba(239,68,68,.18); color:#fca5a5}
+.page{max-width:1200px; margin:0 auto; padding:32px 28px;}
+.pageTitle{margin:0 0 4px; font-size:24px}
+.pageSub{color:var(--muted); margin:0 0 24px}
+.pageHead{display:flex; justify-content:space-between; align-items:flex-start;
+  margin-bottom:20px}
+.exportBtn{padding:10px 18px; border-radius:10px; background:var(--accent);
+  color:#04150a; text-decoration:none; font-weight:600;
+  box-shadow:0 6px 20px rgba(34,197,94,.25);}
+.logFile{background:var(--panel); border:1px solid var(--line);
+  border-radius:14px; margin-bottom:16px; overflow:hidden;}
+.logFileHead{display:flex; gap:10px; align-items:center; padding:12px 16px;
+  border-bottom:1px solid var(--line); background:rgba(15,23,42,.5);}
+.logDot{width:8px; height:8px; border-radius:50%; background:var(--green)}
+.logSize{color:var(--muted); font-size:11px; margin-left:auto}
+.logFile pre{margin:0; padding:16px; background:#060a12; color:#c9d6e3;
+  font:12px/1.6 'JetBrains Mono',Consolas,monospace;
+  overflow-x:auto; max-height:420px;}
+.kpiRow{display:flex; gap:14px; flex-wrap:wrap; margin-bottom:22px}
+.kpi{flex:1; min-width:140px; padding:18px 20px; border-radius:14px;
+  background:var(--panel); border:1px solid var(--line);
+  display:flex; flex-direction:column; gap:4px;}
+.kpi b{font-size:26px}
+.kpi span{color:var(--muted); font-size:12px; text-transform:uppercase;
+  letter-spacing:.6px}
+.tableWrap{background:var(--panel); border:1px solid var(--line);
+  border-radius:14px; overflow:hidden;}
+table{width:100%; border-collapse:collapse; font-size:13px}
+th,td{padding:12px 16px; text-align:left; vertical-align:top}
+th{background:rgba(15,23,42,.6); font-size:11px; text-transform:uppercase;
+  letter-spacing:.6px; color:var(--muted); font-weight:600;
+  border-bottom:1px solid var(--line);}
+tr{border-bottom:1px solid var(--line)}
+tr:last-child{border-bottom:none}
+tr:hover td{background:rgba(148,163,184,.04)}
+td code{background:rgba(15,23,42,.6); padding:2px 8px; border-radius:6px;
+  font-size:11px; color:#a7f3c8; word-break:break-all; display:inline-block;
+  max-width:420px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  vertical-align:middle;}
+.flashArea{position:fixed; right:24px; top:80px; z-index:2000;
+  display:flex; flex-direction:column; gap:10px;}
+.toast{padding:12px 18px; border-radius:12px;
+  background:rgba(15,23,42,.95); border:1px solid var(--line);
+  color:var(--text); font-weight:500;
+  box-shadow:0 10px 30px rgba(0,0,0,.4);
+  animation:slideIn .3s ease; min-width:240px;}
+.toast.success{border-color:rgba(34,197,94,.45);
+  box-shadow:0 0 0 1px rgba(34,197,94,.3),0 10px 30px rgba(0,0,0,.4);}
+.toast.error{border-color:rgba(239,68,68,.45);}
+@keyframes slideIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:none}}
+.leaflet-popup-content-wrapper{background:#0f172a; color:var(--text);
+  border:1px solid var(--line); border-radius:12px;
+  box-shadow:0 10px 30px rgba(0,0,0,.5);}
+.leaflet-popup-tip{background:#0f172a; border:1px solid var(--line)}
+.leaflet-popup-content{margin:12px 14px}
+.leaflet-popup-content a{color:var(--green)}
+.leaflet-container{background:#060a12; font-family:'Inter',sans-serif}
+.markerDot{width:22px; height:22px; border-radius:50%;
+  background:radial-gradient(circle at 30% 30%,#86efac,#16a34a);
+  border:3px solid rgba(255,255,255,.85);
+  box-shadow:0 0 0 6px rgba(34,197,94,.2),0 0 20px rgba(34,197,94,.6);
+  animation:pulse 2s infinite;}
+.markerDot.video{background:radial-gradient(circle at 30% 30%,#fca5a5,#dc2626);
+  box-shadow:0 0 0 6px rgba(239,68,68,.2),0 0 20px rgba(239,68,68,.6);}
+@keyframes pulse{0%,100%{transform:scale(1);opacity:1}
+  50%{transform:scale(1.15);opacity:.85}}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">&#9851;</div>
+    <div>
+      <h1>TrashVision</h1>
+      <small>детектор незаконных свалок</small>
+    </div>
+  </div>
+  <nav class="nav">
+    <a href="/" class="{% if request.path == '/' %}active{% endif %}">
+      <span class="dot"></span> Карта
+    </a>
+    <a href="/logs" class="{% if request.path == '/logs' %}active{% endif %}">
+      <span class="dot"></span> Логи
+    </a>
+    <a href="/reports" class="{% if request.path == '/reports' %}active{% endif %}">
+      <span class="dot"></span> Отчёты
+    </a>
+  </nav>
+  <div class="stats">
+    <div class="stat"><b>{{ nav_total }}</b><span>всего</span></div>
+    <div class="stat"><b>{{ nav_images }}</b><span>фото</span></div>
+    <div class="stat"><b>{{ nav_videos }}</b><span>видео</span></div>
+  </div>
+</header>
+
+<div class="flashArea" id="flashArea">
+  {% with msgs = get_flashed_messages(with_categories=true) %}
+    {% for cat, m in msgs %}
+      <div class="toast {{ cat }}">{{ m }}</div>
+    {% endfor %}
+  {% endwith %}
+</div>
+
+<main>{% block content %}{% endblock %}</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+  const mapEl = document.getElementById("map");
+  if (mapEl && window.L) {
+    const map = L.map(mapEl).setView([55.751244, 37.618423], 11);
+    L.tileLayer(
+      "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+      { maxZoom: 19, attribution: "© OpenStreetMap · © Carto" }
+    ).addTo(map);
+
+    const points = window.__POINTS__ || [];
+    points.forEach((p, i) => {
+      if (!p.lat || !p.lng) return;
+      const isVideo = p.type === "video";
+      const icon = L.divIcon({
+        className: "",
+        html: '<div class="markerDot ' + (isVideo ? "video" : "") + '"></div>',
+        iconSize: [22, 22], iconAnchor: [11, 11],
+      });
+      const marker = L.marker([p.lat, p.lng], { icon }).addTo(map);
+      marker.bindPopup(
+        "<b>#" + p.id + "</b> · " + p.created_at + "<br>" +
+        '<span style="color:#94a3b8">' + p.location + "</span><br>" +
+        '<span style="font-size:11px">' +
+        (isVideo ? "видео" : "фото") + "</span><br>" +
+        (p.result ? '<a href="' + p.result + '" target="_blank">Открыть результат</a>' : "")
+      );
+      if (i === 0) marker.openPopup();
+    });
+  }
+
+  document.querySelectorAll(".dropzone").forEach((zone) => {
+    const input = zone.querySelector("input[type=file]");
+    const label = zone.querySelector("span");
+    zone.addEventListener("dragover", (e) => {
+      e.preventDefault(); zone.classList.add("hover");
+    });
+    zone.addEventListener("dragleave", () => zone.classList.remove("hover"));
+    zone.addEventListener("drop", (e) => {
+      e.preventDefault(); zone.classList.remove("hover");
+      if (!e.dataTransfer.files.length) return;
+      const dt = new DataTransfer();
+      dt.items.add(e.dataTransfer.files[0]);
+      input.files = dt.files;
+      if (label) label.textContent = e.dataTransfer.files[0].name;
+    });
+  });
+
+  document.querySelectorAll(".toast").forEach((t) => {
+    setTimeout(() => {
+      t.style.transition = "opacity .4s, transform .4s";
+      t.style.opacity = "0";
+      t.style.transform = "translateX(30px)";
+      setTimeout(() => t.remove(), 400);
+    }, 5000);
+  });
+});
+</script>
+</body>
+</html>
+"""
+
+INDEX_HTML = """
+{% extends "BASE" %}
+{% block title %}Карта · TrashVision{% endblock %}
+{% block content %}
+<div class="layout">
+  <aside class="sidebar">
+    <section class="card">
+      <div class="cardHead">
+        <div class="icon photo">&#128247;</div>
+        <div>
+          <h2>Загрузить фото</h2>
+          <small>YOLO найдёт мусор на снимке</small>
+        </div>
+      </div>
+      <form action="/upload_image" method="post" enctype="multipart/form-data">
+        <label class="dropzone">
+          <input type="file" name="file" accept="image/*" required
+                 onchange="this.parentNode.querySelector('span').textContent = this.files[0]?.name || 'Выберите файл'">
+          <div class="dropIcon">&#11014;</div>
+          <span>Перетащите или выберите фото</span>
+        </label>
+        <input name="location" placeholder="Место (адрес, описание)">
+        <div class="row2">
+          <input name="lat" placeholder="Широта" value="55.75">
+          <input name="lng" placeholder="Долгота" value="37.61">
+        </div>
+        <button class="primary" type="submit">Обработать фото</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <div class="cardHead">
+        <div class="icon video">&#127916;</div>
+        <div>
+          <h2>Загрузить видео</h2>
+          <small>раз в 30 кадров, может занять время</small>
+        </div>
+      </div>
+      <form action="/upload_video" method="post" enctype="multipart/form-data">
+        <label class="dropzone">
+          <input type="file" name="file" accept="video/*" required
+                 onchange="this.parentNode.querySelector('span').textContent = this.files[0]?.name || 'Выберите файл'">
+          <div class="dropIcon">&#11014;</div>
+          <span>Перетащите или выберите видео</span>
+        </label>
+        <input name="location" placeholder="Место">
+        <div class="row2">
+          <input name="lat" placeholder="Широта" value="55.75">
+          <input name="lng" placeholder="Долгота" value="37.61">
+        </div>
+        <button class="primary" type="submit">Обработать видео</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <div class="cardHead">
+        <div class="icon recent">&#128337;</div>
+        <div>
+          <h2>Последние</h2>
+          <small>10 записей</small>
+        </div>
+      </div>
+      <div class="recentList">
+        {% for p in points[:10] %}
+        <div class="recentItem {{ p.type }}">
+          <div class="recentTop">
+            <b>#{{ p.id }}</b>
+            <span class="badge {{ p.type }}">{{ p.type }}</span>
+          </div>
+          <div class="recentLoc">{{ p.location }}</div>
+          <div class="recentMeta">{{ p.created_at }}</div>
+          <a class="recentLink" href="{{ p.result }}" target="_blank">Открыть результат &rarr;</a>
+        </div>
+        {% else %}
+        <div class="empty">Пока ничего не обработано</div>
+        {% endfor %}
+      </div>
+    </section>
+  </aside>
+
+  <div id="map"></div>
+</div>
+
+<script>
+  window.__POINTS__ = {{ points|tojson }};
+</script>
+{% endblock %}
+"""
+
+LOGS_HTML = """
+{% extends "BASE" %}
+{% block title %}Логи · TrashVision{% endblock %}
+{% block content %}
+<div class="page">
+  <h2 class="pageTitle">Журнал обнаружений</h2>
+  <p class="pageSub">Все записи по дням, от новых к старым</p>
+  {% if not files %}
+    <div class="empty">Логов пока нет — обработайте первое фото или видео</div>
+  {% endif %}
+  {% for f in files %}
+    <section class="logFile">
+      <div class="logFileHead">
+        <span class="logDot"></span>
+        <b>{{ f.name }}</b>
+        <span class="logSize">{{ f.content|length }} симв.</span>
+      </div>
+      <pre>{{ f.content }}</pre>
+    </section>
+  {% endfor %}
+</div>
+{% endblock %}
+"""
+
+REPORTS_HTML = """
+{% extends "BASE" %}
+{% block title %}Отчёты · TrashVision{% endblock %}
+{% block content %}
+<div class="page">
+  <div class="pageHead">
+    <div>
+      <h2 class="pageTitle">Сводный отчёт</h2>
+      <p class="pageSub">Сформирован {{ generated }}</p>
+    </div>
+    <a class="exportBtn" href="/reports/export">&#11015; Скачать CSV</a>
+  </div>
+
+  <div class="kpiRow">
+    <div class="kpi"><b>{{ total }}</b><span>Всего записей</span></div>
+    {% for k, v in by_type.items() %}
+      <div class="kpi"><b>{{ v }}</b><span>{{ k }}</span></div>
+    {% endfor %}
+  </div>
+
+  <div class="tableWrap">
+    <table>
+      <thead>
+        <tr><th>ID</th><th>Дата</th><th>Место</th><th>Тип</th><th>Обнаружения</th></tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+          <tr>
+            <td><b>#{{ r[0] }}</b></td>
+            <td>{{ r[1] }}</td>
+            <td>{{ r[2] }}</td>
+            <td><span class="badge {{ r[3] }}">{{ r[3] }}</span></td>
+            <td><code>{{ r[4] }}</code></td>
+          </tr>
+        {% else %}
+          <tr><td colspan="5" class="empty">Нет данных</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+"""
+
+
+# ---------- рендер с учётом наследования ----------
+def render_page(name: str, **ctx):
+    base = BASE_HTML.replace("{% block title %}TrashVision{% endblock %}", "")
+    page = {"index": INDEX_HTML, "logs": LOGS_HTML, "reports": REPORTS_HTML}[name]
+    body = page.replace('{% extends "BASE" %}', "")
+    # извлекаем содержимое content-блока
+    if "{% block content %}" in body:
+        start = body.index("{% block content %}") + len("{% block content %}")
+        end = body.rindex("{% endblock %}")
+        body = body[start:end]
+    title = "TrashVision"
+    if "{% block title %}" in page:
+        ts = page.index("{% block title %}") + len("{% block title %}")
+        te = page.index("{% endblock %}", ts)
+        title = page[ts:te].strip()
+    base = base.replace("{% block title %}TrashVision{% endblock %}", title)
+    base = base.replace("{% block content %}{% endblock %}", body)
+    return render_template_string(base, **ctx)
+
+
+# ---------- маршруты ----------
+@app.context_processor
+def inject_globals():
+    con = sqlite3.connect(DB)
+    total = con.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
+    imgs = con.execute(
+        "SELECT COUNT(*) FROM reports WHERE source_type='image'"
+    ).fetchone()[0]
+    vids = con.execute(
+        "SELECT COUNT(*) FROM reports WHERE source_type='video'"
+    ).fetchone()[0]
+    con.close()
+    return {
+        "nav_total": total,
+        "nav_images": imgs,
+        "nav_videos": vids,
+        "now": datetime.now(),
+    }
+
+
+def _row_to_dict(r):
+    return {
+        "id": r[0], "created_at": r[1], "location": r[2],
+        "lat": r[3], "lng": r[4], "type": r[5],
+        "file": r[6], "result": r[7], "detections": r[8],
+        "log_url": r[9] if len(r) > 9 else None,
+    }
+
+
+@app.route("/")
+def index():
+    con = sqlite3.connect(DB)
+    rows = con.execute(
+        "SELECT id, created_at, location, lat, lng, source_type, "
+        "file_url, result_url, detections, log_url "
+        "FROM reports ORDER BY id DESC LIMIT 50"
+    ).fetchall()
+    con.close()
+    points = [_row_to_dict(r) for r in rows]
+    return render_page("index", points=points)
+
+
+@app.route("/upload_image", methods=["POST"])
+def upload_image():
+    f = request.files.get("file")
+    location = request.form.get("location", "").strip() or "Не указано"
+    try:
+        lat = float(request.form.get("lat") or 55.751244)
+        lng = float(request.form.get("lng") or 37.618423)
+    except ValueError:
+        lat, lng = 55.751244, 37.618423
+
+    if not f or not f.filename:
+        flash("Файл не выбран", "error")
+        return redirect(url_for("index"))
+
+    name = f"{uuid.uuid4().hex[:8]}_{f.filename}"
+    path = os.path.join(UPLOAD_DIR, name)
+    f.save(path)
+
+    detections, result_url = detect_image(path)
+    log_url = write_log(detections, name, location)
+
+    con = sqlite3.connect(DB)
+    con.execute(
+        "INSERT INTO reports (created_at, location, lat, lng, source_type, "
+        "file_url, result_url, detections, log_url, status) "
+        "VALUES (?,?,?,?,?,?,?,?,?,'done')",
+        (datetime.now().strftime("%Y-%m-%d %H:%M"), location, lat, lng,
+         "image", f"/{path}", result_url, str(detections), log_url),
+    )
+    con.commit()
+    con.close()
+
+    flash(f"Фото обработано. Объектов: {len(detections)}", "success")
+    return redirect(url_for("index"))
+
+
+@app.route("/upload_video", methods=["POST"])
+def upload_video():
+    f = request.files.get("file")
+    location = request.form.get("location", "").strip() or "Не указано"
+    try:
+        lat = float(request.form.get("lat") or 55.751244)
+        lng = float(request.form.get("lng") or 37.618423)
+    except ValueError:
+        lat, lng = 55.751244, 37.618423
+
+    if not f or not f.filename:
+        flash("Файл не выбран", "error")
+        return redirect(url_for("index"))
+
+    name = f"{uuid.uuid4().hex[:8]}_{f.filename}"
+    path = os.path.join(UPLOAD_DIR, name)
+    f.save(path)
+
+    summary = detect_video(path)
+    dets = summary["detections"]
+    log_url = write_log(dets, name, location)
+
+    con = sqlite3.connect(DB)
+    con.execute(
+        "INSERT INTO reports (created_at, location, lat, lng, source_type, "
+        "file_url, result_url, detections, log_url, status) "
+        "VALUES (?,?,?,?,?,?,?,?,?,'done')",
+        (datetime.now().strftime("%Y-%m-%d %H:%M"), location, lat, lng,
+         "video", f"/{path}", summary["result_video"], str(dets), log_url),
+    )
+    con.commit()
+    con.close()
+
+    flash(f"Видео обработано. Вхождений: {len(dets)}", "success")
+    return redirect(url_for("index"))
+
+
+@app.route("/api/points")
+def api_points():
+    con = sqlite3.connect(DB)
+    rows = con.execute(
+        "SELECT id, created_at, location, lat, lng, source_type, "
+        "result_url, detections FROM reports WHERE lat IS NOT NULL"
+    ).fetchall()
+    con.close()
+    return jsonify([{
+        "id": r[0], "date": r[1], "location": r[2],
+        "lat": r[3], "lng": r[4], "type": r[5],
+        "result": r[6], "count": r[7].count("'class'") if r[7] else 0,
+    } for r in rows])
+
+
+@app.route("/logs")
+def logs():
+    files = []
+    if os.path.exists(LOG_DIR):
+        for fn in sorted(os.listdir(LOG_DIR), reverse=True):
+            p = os.path.join(LOG_DIR, fn)
+            with open(p, encoding="utf-8") as fh:
+                files.append({"name": fn, "content": fh.read()})
+    return render_page("logs", files=files)
+
+
+@app.route("/reports")
+def reports():
+    con = sqlite3.connect(DB)
+    rows = con.execute(
+        "SELECT id, created_at, location, source_type, detections "
+        "FROM reports ORDER BY id DESC"
+    ).fetchall()
+    con.close()
+    total = len(rows)
+    by_type = {}
+    for r in rows:
+        by_type[r[3]] = by_type.get(r[3], 0) + 1
+    return render_page("reports", rows=rows, total=total,
+                       by_type=by_type,
+                       generated=datetime.now().strftime("%d.%m.%Y %H:%M"))
+
+
+@app.route("/reports/export")
+def export_reports():
+    con = sqlite3.connect(DB)
+    rows = con.execute(
+        "SELECT id, created_at, location, lat, lng, source_type, detections "
+        "FROM reports"
+    ).fetchall()
+    con.close()
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";")
+    w.writerow(["ID", "Дата", "Место", "Широта", "Долгота", "Тип",
+                "Обнаружения"])
+    for r in rows:
+        w.writerow(r)
+    mem = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
+    return send_file(
+        mem, mimetype="text/csv", as_attachment=True,
+        download_name=f"report_{datetime.now():%Y%m%d}.csv",
+    )
+
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)

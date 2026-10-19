@@ -1,0 +1,37 @@
+[2026-10-19 20:12:27] source=1cbec473_j0u3ci28fx5w7wsgouz2af0w5b49mtve.jpg location=Не указано
+  - объектов не обнаружено
+
+[2026-10-19 20:19:39] source=b2af5494_j0u3ci28fx5w7wsgouz2af0w5b49mtve.jpg location=Не указано
+  - объектов не обнаружено
+
+[2026-10-19 20:19:41] source=db977515_j0u3ci28fx5w7wsgouz2af0w5b49mtve.jpg location=Не указано
+  - объектов не обнаружено
+
+[2026-10-19 20:19:47] source=cfde5bb6_j0u3ci28fx5w7wsgouz2af0w5b49mtve.jpg location=Не указано
+  - объектов не обнаружено
+
+[2026-10-19 20:26:11] source=15408343_DJI_0821_8_106_TC.jpg location=Не указано
+  - объектов не обнаружено
+
+[2026-10-19 22:37:08] source=51a66330_j0u3ci28fx5w7wsgouz2af0w5b49mtve.jpg location=Не указано
+  - объектов не обнаружено
+
+[2026-10-19 22:37:08] source=aecb788c_j0u3ci28fx5w7wsgouz2af0w5b49mtve.jpg location=Не указано
+  - объектов не обнаружено
+
+[2026-10-19 22:37:08] source=1d92935c_j0u3ci28fx5w7wsgouz2af0w5b49mtve.jpg location=Не указано
+  - объектов не обнаружено
+
+[2026-10-19 22:38:41] source=028db9b7_DJI_0821_0_0_BR.jpg location=Не указано
+  - объектов не обнаружено
+
+[2026-10-19 22:48:42] source=6fbac96a_DJI_0821_8_106_TR.jpg location=Не указано
+  - объектов не обнаружено (0)
+
+[2026-10-19 22:50:40] source=50b28ceb_DJI_0821_218_2265_TC.jpg location=Не указано
+  - объектов не обнаружено (0)
+
+[2026-10-19 23:39:03] source=fcc0f537_DJI_0821_32_370_TC.jpg location=Не указано
+  - объектов найдено: 1
+  * waste conf=0.553 bbox=[459, 702, 513, 781]
+
